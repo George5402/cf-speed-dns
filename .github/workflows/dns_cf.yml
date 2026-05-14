@@ -9,9 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 'Checkout'
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: 'Set up Python'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: 3.12
       - name: 'Install dependencies'
@@ -22,4 +22,4 @@ jobs:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_DNS_NAME: ${{ secrets.CF_DNS_NAME }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-            run: python dnscf.py
+        run: python dnscf.py
