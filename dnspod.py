@@ -1,101 +1,197 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import time
-import requests
-from qCloud import QcloudApiv3
-import traceback
-import os
+import hashlib
+import hmac
 import json
+import os
+import time
+import traceback
 
-# 域名和子域名
-DOMAIN = os.environ['DOMAIN']
-SUB_DOMAIN = os.environ['SUB_DOMAIN']
+import requests
 
-# API 密钥
+DOMAIN = os.environ["DOMAIN"]
+SUB_DOMAIN = os.environ["SUB_DOMAIN"]
 SECRETID = os.environ["SECRETID"]
 SECRETKEY = os.environ["SECRETKEY"]
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
-# pushplus_token
-PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
+TENCENT_ENDPOINT = "dnspod.tencentcloudapi.com"
+TENCENT_SERVICE = "dnspod"
+TENCENT_VERSION = "2021-03-23"
+TENCENT_REGION = ""
+
+
+def tencent_api(action, payload):
+    if not SECRETID or not SECRETKEY:
+        raise RuntimeError("SECRETID and SECRETKEY must be configured in GitHub Actions secrets")
+
+    timestamp = int(time.time())
+    date = time.strftime("%Y-%m-%d", time.gmtime(timestamp))
+    payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    content_type = "application/json; charset=utf-8"
+
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{TENCENT_ENDPOINT}\n"
+    )
+    signed_headers = "content-type;host"
+    hashed_payload = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+    canonical_request = (
+        f"POST\n/\n\n{canonical_headers}\n"
+        f"{signed_headers}\n{hashed_payload}"
+    )
+
+    credential_scope = f"{date}/{TENCENT_SERVICE}/tc3_request"
+    hashed_canonical_request = hashlib.sha256(
+        canonical_request.encode("utf-8")
+    ).hexdigest()
+    string_to_sign = (
+        f"TC3-HMAC-SHA256\n{timestamp}\n{credential_scope}\n"
+        f"{hashed_canonical_request}"
+    )
+
+    secret_date = hmac.new(
+        f"TC3{SECRETKEY}".encode("utf-8"), date.encode("utf-8"), hashlib.sha256
+    ).digest()
+    secret_service = hmac.new(
+        secret_date, TENCENT_SERVICE.encode("utf-8"), hashlib.sha256
+    ).digest()
+    secret_signing = hmac.new(
+        secret_service, b"tc3_request", hashlib.sha256
+    ).digest()
+    signature = hmac.new(
+        secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+    authorization = (
+        f"TC3-HMAC-SHA256 Credential={SECRETID}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    headers = {
+        "Authorization": authorization,
+        "Content-Type": content_type,
+        "Host": TENCENT_ENDPOINT,
+        "X-TC-Action": action,
+        "X-TC-Version": TENCENT_VERSION,
+        "X-TC-Timestamp": str(timestamp),
+    }
+    if TENCENT_REGION:
+        headers["X-TC-Region"] = TENCENT_REGION
+
+    response = requests.post(
+        f"https://{TENCENT_ENDPOINT}",
+        data=payload_json.encode("utf-8"),
+        headers=headers,
+        timeout=20,
+    )
+    response.raise_for_status()
+    result = response.json()
+    error = result.get("Response", {}).get("Error")
+    if error:
+        raise RuntimeError(
+            f"TencentCloud API error {error.get('Code')}: {error.get('Message')}"
+        )
+    return result.get("Response", {})
+
+
+def get_records():
+    response = tencent_api(
+        "DescribeRecordList",
+        {
+            "Domain": DOMAIN,
+            "Subdomain": SUB_DOMAIN,
+            "RecordType": "A",
+            "Limit": 100,
+        },
+    )
+    records = []
+    for record in response.get("RecordList", []):
+        if record.get("RecordLine") == "默认":
+            records.append(
+                {"recordId": record["RecordId"], "value": record["Value"]}
+            )
+    print(
+        "get_records success: ---- Time: "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---- records: {records}"
+    )
+    return records
 
 
 def get_cf_speed_test_ip(timeout=10, max_retries=5):
     for attempt in range(max_retries):
         try:
-            # 发送 GET 请求，设置超时
-            response = requests.get('https://ip.164746.xyz/ipTop.html', timeout=timeout)
+            response = requests.get(
+                "https://ip.164746.xyz/ipTop.html", timeout=timeout
+            )
+            response.raise_for_status()
+            ips = [ip.strip() for ip in response.text.split(",") if ip.strip()]
+            if ips:
+                return ips
+        except Exception as exc:
+            print(
+                f"get_cf_speed_test_ip failed "
+                f"(attempt {attempt + 1}/{max_retries}): {exc}"
+            )
+            time.sleep(1)
+    raise RuntimeError("Unable to obtain Cloudflare speed-test IP addresses")
 
-            # 检查响应状态码
-            if response.status_code == 200:
-                return response.text
-        except Exception as e:
-            traceback.print_exc()
-            print(f"get_cf_speed_test_ip Request failed (attempt {attempt + 1}/{max_retries}): {e}")
-    # 如果所有尝试都失败，返回 None 或者抛出异常，根据需要进行处理
-    return None
 
-
-def build_info(cloud):
+def change_dns(record_id, cf_ip):
     try:
-        ret = cloud.get_record(DOMAIN, 100, SUB_DOMAIN, 'A')
-        def_info = []
-        for record in ret["data"]["records"]:
-            info = {"recordId": record["id"], "value": record["value"]}
-            if record["line"] == "默认":
-                def_info.append(info)
-        print(f"build_info success: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- ip：" + str(def_info))
-        return def_info
-    except Exception as e:
+        tencent_api(
+            "ModifyRecord",
+            {
+                "Domain": DOMAIN,
+                "RecordId": record_id,
+                "SubDomain": SUB_DOMAIN,
+                "Value": cf_ip,
+                "RecordType": "A",
+                "RecordLine": "默认",
+                "TTL": 600,
+            },
+        )
+        print(
+            "change_dns success: ---- Time: "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---- ip: {cf_ip}"
+        )
+        return f"ip:{cf_ip} 解析 {SUB_DOMAIN}.{DOMAIN} 成功"
+    except Exception as exc:
         traceback.print_exc()
-        print(f"build_info ERROR: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- MESSAGE: " + str(e))
-
-
-def change_dns(cloud, record_id, cf_ip):
-    try:
-        cloud.change_record(DOMAIN, record_id, SUB_DOMAIN, cf_ip, "A", "默认", 600)
-        print(f"change_dns success: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- ip：" + str(cf_ip))
-        return "ip:" + str(cf_ip) + "解析" + str(SUB_DOMAIN) + "." + str(DOMAIN) + "成功"
-
-    except Exception as e:
-        traceback.print_exc()
-        print(f"change_dns ERROR: ---- Time: " + str(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())) + " ---- MESSAGE: " + str(e))
-        return "ip:" + str(cf_ip) + "解析" + str(SUB_DOMAIN) + "." + str(DOMAIN) + "失败"
+        print(f"change_dns ERROR: {exc}")
+        return f"ip:{cf_ip} 解析 {SUB_DOMAIN}.{DOMAIN} 失败"
 
 
 def pushplus(content):
-    url = 'http://www.pushplus.plus/send'
-    data = {
-        "token": PUSHPLUS_TOKEN,
-        "title": "IP优选DNSPOD推送",
-        "content": content,
-        "template": "markdown",
-        "channel": "wechat"
-    }
-    body = json.dumps(data).encode(encoding='utf-8')
-    headers = {'Content-Type': 'application/json'}
-    requests.post(url, data=body, headers=headers)
+    if not PUSHPLUS_TOKEN:
+        print("PUSHPLUS_TOKEN is not configured; skip notification")
+        return
+    response = requests.post(
+        "https://www.pushplus.plus/send",
+        json={
+            "token": PUSHPLUS_TOKEN,
+            "title": "IP优选DNSPOD推送",
+            "content": content,
+            "template": "markdown",
+            "channel": "wechat",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
 
 
-if __name__ == '__main__':
-    # 构造环境
-    cloud = QcloudApiv3(SECRETID, SECRETKEY)
+if __name__ == "__main__":
+    records = get_records()
+    if not records:
+        raise RuntimeError(f"No default A records found for {SUB_DOMAIN}.{DOMAIN}")
 
-    # 获取DNS记录
-    info = build_info(cloud)
+    ip_addresses = get_cf_speed_test_ip()
+    if len(ip_addresses) > len(records):
+        raise RuntimeError(
+            f"Received {len(ip_addresses)} IPs but only {len(records)} DNS records exist"
+        )
 
-    # 获取最新优选IP
-    ip_addresses_str = get_cf_speed_test_ip()
-    ip_addresses = ip_addresses_str.split(',')
-
-    pushplus_content = []
-    # 遍历 IP 地址列表
+    results = []
     for index, ip_address in enumerate(ip_addresses):
-        # 执行 DNS 变更
-        dns = change_dns(cloud, info[index]["recordId"], ip_address)
-        pushplus_content.append(dns)
+        results.append(change_dns(records[index]["recordId"], ip_address))
 
-    pushplus('\n'.join(pushplus_content))
+    pushplus("\n".join(results))
