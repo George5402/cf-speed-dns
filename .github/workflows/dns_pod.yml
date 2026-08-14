@@ -3,6 +3,10 @@ name: 'dns_pod_push'
 on:
   schedule:
     - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -10,12 +14,41 @@ jobs:
     steps:
       - name: 'Checkout'
         uses: actions/checkout@v4
+
       - name: 'Set up Python'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: 'Install dependencies'
         run: python -m pip install -r requirements.txt
+
+      - name: 'Build linux/386 binary'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 'Build with PyInstaller'
+        uses: addnab/docker-run-action@v3
+        with:
+          image: i386/python:3.12-slim
+          options: --platform linux/386 -v ${{ github.workspace }}:/src -w /src
+          run: |
+            python -m pip install --upgrade pip pyinstaller
+            python -m pip install -r requirements.txt
+            pyinstaller --onefile --name cf-speed-dns-linux-386 dnspod.py
+
+      - name: 'Upload linux/386 artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-speed-dns-linux-386
+          path: dist/cf-speed-dns-linux-386
+          if-no-files-found: error
+
+      - name: 'Publish linux/386 binary to GitHub Release'
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/cf-speed-dns-linux-386
+
       - name: 'Run DNSPod updater'
         env:
           DOMAIN: ${{ secrets.DOMAIN }}
